@@ -1,18 +1,21 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
-import { cosineSimilarity } from "ai";
+import { neon } from "@neondatabase/serverless";
 
 /**
- * A simple file-backed vector store.
+ * Production vector store: Neon Postgres + pgvector.
  *
- * For a video / demo this keeps things obvious:
- *   - chunks live in memory as a Map
- *   - the whole map is persisted to a JSON file on disk
- *   - similarity search loads everything and uses cosineSimilarity from `ai`
+ * This is a DROP-IN replacement for the local JSON file store.
+ * Same public API — addDocument / search / listDocuments / deleteDocument —
+ * so nothing else in the app changes.
  *
- * For production: swap this class for Postgres + pgvector, Pinecone, Qdrant,
- * Turbopuffer, etc. The public API (addDocument / search / listDocuments /
- * deleteDocument) is intentionally small so the swap is mechanical.
+ * Differences from the demo store:
+ *   - Cosine similarity is computed IN THE DATABASE using pgvector's `<=>`
+ *     operator (cosine distance). similarity = 1 - distance.
+ *     So we no longer import `cosineSimilarity` from `ai` here.
+ *   - Works on Vercel's read-only serverless filesystem (no disk writes).
+ *
+ * Requires:
+ *   - DATABASE_URL env var (Neon connection string)
+ *   - the pgvector extension + tables created (see db/schema.sql)
  */
 
 export type StoredChunk = {
@@ -21,7 +24,7 @@ export type StoredChunk = {
   documentName: string;
   chunkIndex: number;
   content: string;
-  embedding: number[];
+  embedding: number[]; // kept in the type for API parity; not returned by search
 };
 
 export type StoredDocument = {
@@ -32,131 +35,139 @@ export type StoredDocument = {
 };
 
 export type SearchResult = {
-  chunk: StoredChunk;
+  chunk: Omit<StoredChunk, "embedding">;
   similarity: number;
 };
 
-type Snapshot = {
-  documents: StoredDocument[];
-  chunks: StoredChunk[];
-};
+if (!process.env.DATABASE_URL) {
+  // Fail loud and early instead of a confusing runtime error later.
+  throw new Error("DATABASE_URL is not set. Add it to your environment.");
+}
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const DATA_FILE = path.join(DATA_DIR, "vector-store.json");
+const sql = neon(process.env.DATABASE_URL);
+
+// pgvector accepts the text form "[0.1,0.2,...]" and casts it with ::vector.
+function toVectorLiteral(embedding: number[]): string {
+  return `[${embedding.join(",")}]`;
+}
 
 class VectorStore {
-  private documents = new Map<string, StoredDocument>();
-  private chunks = new Map<string, StoredChunk>();
-  private loaded = false;
-  private loadPromise: Promise<void> | null = null;
-
-  private async ensureLoaded() {
-    if (this.loaded) return;
-    if (!this.loadPromise) this.loadPromise = this.load();
-    await this.loadPromise;
-  }
-
-  private async load() {
-    try {
-      await fs.mkdir(DATA_DIR, { recursive: true });
-      const raw = await fs.readFile(DATA_FILE, "utf8");
-      const snap = JSON.parse(raw) as Snapshot;
-      for (const doc of snap.documents) this.documents.set(doc.id, doc);
-      for (const chunk of snap.chunks) this.chunks.set(chunk.id, chunk);
-    } catch (err: unknown) {
-      // First run — file does not exist yet. That's fine.
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error("vector-store: failed to load", err);
-      }
-    }
-    this.loaded = true;
-  }
-
-  private async persist() {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    const snap: Snapshot = {
-      documents: Array.from(this.documents.values()),
-      chunks: Array.from(this.chunks.values()),
-    };
-    await fs.writeFile(DATA_FILE, JSON.stringify(snap, null, 2), "utf8");
-  }
-
   async addDocument(params: {
     name: string;
     chunks: string[];
     embeddings: number[][];
   }): Promise<StoredDocument> {
-    await this.ensureLoaded();
     if (params.chunks.length !== params.embeddings.length) {
       throw new Error("chunks and embeddings length mismatch");
     }
 
-    const documentId = crypto.randomUUID();
-    const createdAt = new Date().toISOString();
+    // 1) Insert the document row, let Postgres generate the UUID.
+    const [doc] = (await sql`
+      INSERT INTO documents (name, chunk_count)
+      VALUES (${params.name}, ${params.chunks.length})
+      RETURNING id, name, chunk_count, created_at
+    `) as Array<{
+      id: string;
+      name: string;
+      chunk_count: number;
+      created_at: string;
+    }>;
 
-    const doc: StoredDocument = {
-      id: documentId,
-      name: params.name,
-      chunkCount: params.chunks.length,
-      createdAt,
-    };
-    this.documents.set(documentId, doc);
-
+    // 2) Bulk-insert all chunks in a single parameterized statement.
+    //    Build VALUES ($1,$2,$3,$4,$5), ($6,...) ... dynamically.
+    const valuesSql: string[] = [];
+    const queryParams: unknown[] = [];
     params.chunks.forEach((content, i) => {
-      const chunkId = `${documentId}:${i}`;
-      this.chunks.set(chunkId, {
-        id: chunkId,
-        documentId,
-        documentName: params.name,
-        chunkIndex: i,
+      const base = i * 5;
+      valuesSql.push(
+        `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::vector)`
+      );
+      queryParams.push(
+        doc.id,
+        doc.name,
+        i,
         content,
-        embedding: params.embeddings[i],
-      });
+        toVectorLiteral(params.embeddings[i])
+      );
     });
 
-    await this.persist();
-    return doc;
+    await sql.query(
+      `INSERT INTO chunks (document_id, document_name, chunk_index, content, embedding)
+       VALUES ${valuesSql.join(", ")}`,
+      queryParams
+    );
+
+    return {
+      id: doc.id,
+      name: doc.name,
+      chunkCount: doc.chunk_count,
+      createdAt: doc.created_at,
+    };
   }
 
   async search(
     queryEmbedding: number[],
     topK = 4
   ): Promise<SearchResult[]> {
-    await this.ensureLoaded();
-    const all = Array.from(this.chunks.values());
-    if (all.length === 0) return [];
+    const literal = toVectorLiteral(queryEmbedding);
 
-    const scored = all.map((chunk) => ({
-      chunk,
-      similarity: cosineSimilarity(queryEmbedding, chunk.embedding),
+    // `<=>` is cosine distance (0 = identical). similarity = 1 - distance.
+    const rows = (await sql`
+      SELECT
+        id,
+        document_id,
+        document_name,
+        chunk_index,
+        content,
+        1 - (embedding <=> ${literal}::vector) AS similarity
+      FROM chunks
+      ORDER BY embedding <=> ${literal}::vector
+      LIMIT ${topK}
+    `) as Array<{
+      id: string;
+      document_id: string;
+      document_name: string;
+      chunk_index: number;
+      content: string;
+      similarity: number;
+    }>;
+
+    return rows.map((r) => ({
+      similarity: Number(r.similarity),
+      chunk: {
+        id: r.id,
+        documentId: r.document_id,
+        documentName: r.document_name,
+        chunkIndex: r.chunk_index,
+        content: r.content,
+      },
     }));
-
-    scored.sort((a, b) => b.similarity - a.similarity);
-    return scored.slice(0, topK);
   }
 
   async listDocuments(): Promise<StoredDocument[]> {
-    await this.ensureLoaded();
-    return Array.from(this.documents.values()).sort((a, b) =>
-      b.createdAt.localeCompare(a.createdAt)
-    );
+    const rows = (await sql`
+      SELECT id, name, chunk_count, created_at
+      FROM documents
+      ORDER BY created_at DESC
+    `) as Array<{
+      id: string;
+      name: string;
+      chunk_count: number;
+      created_at: string;
+    }>;
+
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      chunkCount: r.chunk_count,
+      createdAt: r.created_at,
+    }));
   }
 
   async deleteDocument(documentId: string): Promise<void> {
-    await this.ensureLoaded();
-    this.documents.delete(documentId);
-    for (const [id, chunk] of this.chunks) {
-      if (chunk.documentId === documentId) this.chunks.delete(id);
-    }
-    await this.persist();
+    // chunks are removed automatically via ON DELETE CASCADE.
+    await sql`DELETE FROM documents WHERE id = ${documentId}`;
   }
 }
 
-// Singleton across hot-reloads in dev.
-declare global {
-  // eslint-disable-next-line no-var
-  var __vectorStore: VectorStore | undefined;
-}
-
-export const vectorStore: VectorStore =
-  globalThis.__vectorStore ?? (globalThis.__vectorStore = new VectorStore());
+export const vectorStore = new VectorStore();
