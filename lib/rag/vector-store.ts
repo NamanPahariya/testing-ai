@@ -39,6 +39,8 @@ export type SearchResult = {
   similarity: number;
 };
 
+
+
 if (!process.env.DATABASE_URL) {
   // Fail loud and early instead of a confusing runtime error later.
   throw new Error("DATABASE_URL is not set. Add it to your environment.");
