@@ -122,7 +122,7 @@ export function Message({ message, onApproval }: Props) {
                     <div className="text-xs text-zinc-700">
                       <span className="font-medium">{part.output.city}</span>:{" "}
                       {part.output.condition},{" "}
-                      {part.output.temperatureCelsius}°C, humidity{" "}
+                      {part.output.temperature}°C, humidity{" "}
                       {part.output.humidity}
                     </div>
                   )}
